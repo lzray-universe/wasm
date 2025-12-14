@@ -1,0 +1,22 @@
+name: build-wasm
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: emscripten/emsdk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          em++ pi13.cpp -O3 -std=c++17 \
+            -sALLOW_MEMORY_GROWTH=1 \
+            -sMODULARIZE=1 -sEXPORT_ES6=1 \
+            -sENVIRONMENT=web \
+            -o pi.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-dist
+          path: |
+            pi.mjs
+            pi.wasm
