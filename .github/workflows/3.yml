@@ -22,7 +22,7 @@ jobs:
             -sENVIRONMENT=web,worker \
             -sINVOKE_RUN=0 \
             -sEXPORTED_RUNTIME_METHODS=callMain \
-            -o dist/pi.mjs
+            -o dist/pi.js
 
           cat > dist/index.html <<'HTML'
           <!doctype html>
@@ -73,7 +73,7 @@ jobs:
           JS
 
           cat > dist/worker.js <<'JS'
-          import createModule from "./pi.mjs";
+          import createModule from "./pi.js";
 
           function looksLikeExit(e) {
             const s = String(e || "");
