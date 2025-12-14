@@ -1,0 +1,180 @@
+name: build-wasm
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: emscripten/emsdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wasm (web + worker) and bundle demo
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf dist
+          mkdir -p dist
+
+          # 关键：ENVIRONMENT 必须包含 worker，否则在 Worker 里可能不可用
+          # 关键：INVOKE_RUN=0 + 导出 callMain，方便 Worker 手动运行 main
+          em++ pi13.cpp -O3 -std=c++17 \
+            -sALLOW_MEMORY_GROWTH=1 \
+            -sMODULARIZE=1 -sEXPORT_ES6=1 \
+            -sENVIRONMENT=web,worker \
+            -sINVOKE_RUN=0 \
+            -sEXPORTED_RUNTIME_METHODS=callMain \
+            -o dist/pi.mjs
+
+          # ---- index.html ----
+          cat > dist/index.html <<'HTML'
+          <!doctype html>
+          <html lang="zh-CN">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>pi wasm demo (worker)</title>
+            <style>
+              body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;max-width:900px;margin:24px auto;padding:0 12px}
+              pre{white-space:pre-wrap;word-break:break-word;background:#f6f7f9;padding:12px;border-radius:10px;max-height:70vh;overflow:auto}
+              input{width:140px}
+              button{margin-left:8px}
+              .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+              .hint{color:#555;font-size:14px}
+              .status{font-size:14px;color:#333}
+            </style>
+          </head>
+          <body>
+            <h1>π 计算（WASM + Web Worker）</h1>
+            <div class="row">
+              <label>小数位 n：</label>
+              <input id="n" value="1000" inputmode="numeric" />
+              <button id="run">运行</button>
+              <button id="stop">停止</button>
+              <button id="clear">清空</button>
+              <span class="status" id="status"></span>
+            </div>
+            <p class="hint">
+              这个版本把计算放到 Web Worker 里，页面不会“卡死”。但 n 很大时输出仍会很长，依然可能占内存。
+              先用 100/1000 测试。
+            </p>
+            <pre id="out"></pre>
+
+            <script type="module" src="./app.js"></script>
+          </body>
+          </html>
+          HTML
+
+          # ---- app.js ----
+          cat > dist/app.js <<'JS'
+          const outEl = document.getElementById("out");
+          const statusEl = document.getElementById("status");
+          const runBtn = document.getElementById("run");
+          const stopBtn = document.getElementById("stop");
+          const clearBtn = document.getElementById("clear");
+          const nEl = document.getElementById("n");
+
+          let worker = null;
+
+          function startWorker() {
+            if (worker) worker.terminate();
+            worker = new Worker("./worker.js", { type: "module" });
+
+            worker.onmessage = (e) => {
+              const msg = e.data;
+              if (msg.type === "chunk") {
+                outEl.textContent += msg.data;
+              } else if (msg.type === "done") {
+                statusEl.textContent = "完成";
+                runBtn.disabled = false;
+                stopBtn.disabled = true;
+              } else if (msg.type === "error") {
+                statusEl.textContent = "出错（见控制台）";
+                console.error(msg.error);
+                runBtn.disabled = false;
+                stopBtn.disabled = true;
+              } else if (msg.type === "status") {
+                statusEl.textContent = msg.data;
+              }
+            };
+
+            worker.onerror = (err) => {
+              statusEl.textContent = "Worker 异常（见控制台）";
+              console.error(err);
+              runBtn.disabled = false;
+              stopBtn.disabled = true;
+            };
+          }
+
+          clearBtn.onclick = () => { outEl.textContent = ""; };
+
+          stopBtn.onclick = () => {
+            if (worker) worker.terminate();
+            worker = null;
+            statusEl.textContent = "已停止";
+            runBtn.disabled = false;
+            stopBtn.disabled = true;
+          };
+
+          runBtn.onclick = () => {
+            const n = String(nEl.value || "").trim();
+            if (!/^\d+$/.test(n)) {
+              outEl.textContent = "请输入非负整数 n（例如 1000）。\n";
+              return;
+            }
+            outEl.textContent = "";
+            statusEl.textContent = "运行中…";
+            runBtn.disabled = true;
+            stopBtn.disabled = false;
+
+            startWorker();
+            worker.postMessage({ n });
+          };
+          JS
+
+          # ---- worker.js ----
+          cat > dist/worker.js <<'JS'
+          import createModule from "./pi.mjs";
+
+          function looksLikeExit(e) {
+            const s = String(e || "");
+            return e?.name === "ExitStatus" || /exit\(\d+\)/.test(s) || /Program terminated/.test(s);
+          }
+
+          self.onmessage = async (e) => {
+            const n = String(e.data?.n ?? "").trim();
+            if (!/^\d+$/.test(n)) {
+              self.postMessage({ type: "error", error: "Invalid n" });
+              return;
+            }
+
+            let input = n + "\n";
+            let idx = 0;
+
+            const print = (text) => self.postMessage({ type: "chunk", data: text + "\n" });
+
+            try {
+              self.postMessage({ type: "status", data: "初始化 WASM…" });
+              const mod = await createModule({
+                noInitialRun: true,
+                stdin: () => (idx < input.length ? input.charCodeAt(idx++) : null),
+                print,
+                printErr: (t) => console.error(t),
+              });
+
+              self.postMessage({ type: "status", data: "计算中…" });
+              mod.callMain([]);
+              self.postMessage({ type: "done" });
+            } catch (err) {
+              if (!looksLikeExit(err)) {
+                self.postMessage({ type: "error", error: String(err) });
+              } else {
+                self.postMessage({ type: "done" });
+              }
+            }
+          };
+          JS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-dist
+          path: dist/**
