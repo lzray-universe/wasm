@@ -1,0 +1,105 @@
+name: build-wasm
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: emscripten/emsdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build + bundle static demo (web + worker)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf dist
+          mkdir -p dist
+
+          # 关键：必须包含 worker，否则你的 worker.js 里 import pi.mjs 会不兼容
+          em++ pi13.cpp -O3 -std=c++17 \
+            -sALLOW_MEMORY_GROWTH=1 \
+            -sMODULARIZE=1 -sEXPORT_ES6=1 \
+            -sENVIRONMENT=web,worker \
+            -sINVOKE_RUN=0 \
+            -sEXPORTED_RUNTIME_METHODS=callMain \
+            -o dist/pi.mjs
+
+          cat > dist/index.html <<'HTML'
+          <!doctype html>
+          <html lang="zh-CN">
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>pi wasm demo (worker)</title>
+          <body>
+            <label>小数位 n：</label>
+            <input id="n" value="1000" />
+            <button id="run">运行</button>
+            <button id="stop">停止</button>
+            <pre id="out" style="white-space:pre-wrap;word-break:break-word;"></pre>
+            <script type="module" src="./app.js"></script>
+          </body>
+          </html>
+          HTML
+
+          cat > dist/app.js <<'JS'
+          const outEl = document.getElementById("out");
+          const runBtn = document.getElementById("run");
+          const stopBtn = document.getElementById("stop");
+          const nEl = document.getElementById("n");
+          let worker = null;
+
+          function startWorker() {
+            if (worker) worker.terminate();
+            worker = new Worker("./worker.js", { type: "module" });
+            worker.onmessage = (e) => {
+              const m = e.data;
+              if (m.type === "chunk") outEl.textContent += m.data;
+            };
+            worker.onerror = (e) => console.error(e);
+          }
+
+          stopBtn.onclick = () => {
+            if (worker) worker.terminate();
+            worker = null;
+          };
+
+          runBtn.onclick = () => {
+            const n = String(nEl.value).trim();
+            if (!/^\d+$/.test(n)) { outEl.textContent = "请输入整数 n\n"; return; }
+            outEl.textContent = "";
+            startWorker();
+            worker.postMessage({ n });
+          };
+          JS
+
+          cat > dist/worker.js <<'JS'
+          import createModule from "./pi.mjs";
+
+          function looksLikeExit(e) {
+            const s = String(e || "");
+            return e?.name === "ExitStatus" || /exit\(\d+\)/.test(s) || /Program terminated/.test(s);
+          }
+
+          self.onmessage = async (e) => {
+            const n = String(e.data?.n ?? "").trim();
+            let input = n + "\n";
+            let idx = 0;
+
+            try {
+              const mod = await createModule({
+                noInitialRun: true,
+                stdin: () => (idx < input.length ? input.charCodeAt(idx++) : null),
+                print: (t) => self.postMessage({ type: "chunk", data: t + "\n" }),
+                printErr: (t) => console.error(t),
+              });
+              mod.callMain([]);
+            } catch (err) {
+              if (!looksLikeExit(err)) console.error(err);
+            }
+          };
+          JS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-dist
+          path: dist/**
