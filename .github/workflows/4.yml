@@ -1,0 +1,172 @@
+name: build-wasm
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: emscripten/emsdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build + bundle static demo (web + worker)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf dist
+          mkdir -p dist
+
+          # 关键修复：
+          # 1) ENVIRONMENT=web,worker 让同一份产物在 Worker 里也能跑
+          # 2) EXIT_RUNTIME=1 确保 main 结束会 exit + flush stdio（你代码里 stdout 是 8MB 全缓冲）
+          # 3) INVOKE_RUN=0 + 导出 callMain，避免初始化就跑、并允许 Worker 手动触发 main
+          em++ pi13.cpp -O3 -std=c++17 \
+            -sALLOW_MEMORY_GROWTH=1 \
+            -sMODULARIZE=1 -sEXPORT_ES6=1 \
+            -sENVIRONMENT=web,worker \
+            -sEXIT_RUNTIME=1 \
+            -sINVOKE_RUN=0 \
+            -sEXPORTED_RUNTIME_METHODS=callMain \
+            -o dist/pi.js
+
+          cat > dist/index.html <<'HTML'
+          <!doctype html>
+          <html lang="zh-CN">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>pi wasm demo (worker)</title>
+            <style>
+              body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;max-width:900px;margin:24px auto;padding:0 12px}
+              pre{white-space:pre-wrap;word-break:break-word;background:#f6f7f9;padding:12px;border-radius:10px;max-height:70vh;overflow:auto}
+              .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+              .status{font-size:14px;color:#333}
+            </style>
+          </head>
+          <body>
+            <h2>π 计算（WASM + Worker）</h2>
+            <div class="row">
+              <label for="n">小数位 n：</label>
+              <input id="n" value="1000" inputmode="numeric" />
+              <button id="run">运行</button>
+              <button id="stop" disabled>停止</button>
+              <button id="clear">清空</button>
+              <span class="status" id="status"></span>
+            </div>
+            <pre id="out"></pre>
+            <script type="module" src="./app.js"></script>
+          </body>
+          </html>
+          HTML
+
+          cat > dist/app.js <<'JS'
+          const outEl = document.getElementById("out");
+          const statusEl = document.getElementById("status");
+          const runBtn = document.getElementById("run");
+          const stopBtn = document.getElementById("stop");
+          const clearBtn = document.getElementById("clear");
+          const nEl = document.getElementById("n");
+
+          let worker = null;
+
+          function setRunning(r) {
+            runBtn.disabled = r;
+            stopBtn.disabled = !r;
+          }
+
+          function startWorker() {
+            if (worker) worker.terminate();
+            worker = new Worker("./worker.js", { type: "module" });
+
+            worker.onmessage = (e) => {
+              const m = e.data || {};
+              if (m.type === "chunk" || m.type === "stderr") outEl.textContent += m.data;
+              if (m.type === "status") statusEl.textContent = m.data;
+
+              if (m.type === "error") {
+                statusEl.textContent = "出错（见输出/控制台）";
+                outEl.textContent += "\n[ERROR]\n" + m.error + "\n";
+                setRunning(false);
+              }
+
+              if (m.type === "done") {
+                statusEl.textContent = "完成";
+                setRunning(false);
+              }
+            };
+
+            worker.onerror = (err) => {
+              statusEl.textContent = "Worker 异常（见控制台）";
+              console.error(err);
+              setRunning(false);
+            };
+          }
+
+          clearBtn.onclick = () => { outEl.textContent = ""; statusEl.textContent = ""; };
+
+          stopBtn.onclick = () => {
+            if (worker) worker.terminate();
+            worker = null;
+            statusEl.textContent = "已停止";
+            setRunning(false);
+          };
+
+          runBtn.onclick = () => {
+            const n = String(nEl.value || "").trim();
+            if (!/^\d+$/.test(n)) {
+              outEl.textContent = "请输入非负整数 n（例如 1000）。\n";
+              return;
+            }
+            outEl.textContent = "";
+            statusEl.textContent = "启动中…";
+            setRunning(true);
+
+            startWorker();
+            worker.postMessage({ n });
+          };
+          JS
+
+          cat > dist/worker.js <<'JS'
+          import createModule from "./pi.js";
+
+          function looksLikeExit(e) {
+            const s = String(e || "");
+            return e?.name === "ExitStatus" || /exit\(\d+\)/.test(s) || /Program terminated/.test(s);
+          }
+
+          self.onmessage = async (e) => {
+            const n = String(e.data?.n ?? "").trim();
+            if (!/^\d+$/.test(n)) {
+              self.postMessage({ type: "error", error: "Invalid n" });
+              return;
+            }
+
+            let input = n + "\n";
+            let idx = 0;
+
+            try {
+              self.postMessage({ type: "status", data: "加载 WASM…" });
+
+              const mod = await createModule({
+                noInitialRun: true,
+                stdin: () => (idx < input.length ? input.charCodeAt(idx++) : null),
+                print: (t) => self.postMessage({ type: "chunk", data: t + "\n" }),
+                printErr: (t) => self.postMessage({ type: "stderr", data: "[stderr] " + t + "\n" }),
+              });
+
+              self.postMessage({ type: "status", data: "计算中…" });
+              mod.callMain([]);
+              self.postMessage({ type: "done" });
+            } catch (err) {
+              if (looksLikeExit(err)) {
+                self.postMessage({ type: "done" });
+              } else {
+                self.postMessage({ type: "error", error: String(err) });
+              }
+            }
+          };
+          JS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-dist
+          path: dist/**
